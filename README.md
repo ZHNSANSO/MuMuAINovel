@@ -210,6 +210,26 @@ OPENAI_BASE_URL=https://api.new-api.com/v1
 OPENAI_BASE_URL=https://your-proxy-service.com/v1
 ```
 
+### Embedding 服务配置
+
+项目支持两种 Embedding 模式：
+1. **Local (默认)**: 使用本地 CPU 运行 `sentence-transformers` 模型，离线可用，隐私性好。
+2. **OpenAI/NVIDIA**: 使用支持 OpenAI 格式的远程 Embedding API（如 NVIDIA NIM）。
+
+配置示例（使用 NVIDIA BGE-M3）：
+
+```bash
+# 切换到 OpenAI 兼容模式
+EMBEDDING_PROVIDER=openai
+
+# 配置 API 信息 (以 NVIDIA NIM 为例)
+EMBEDDING_OPENAI_API_KEY=nvapi-xxxxxxxxxxxxxxxx
+EMBEDDING_OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
+EMBEDDING_OPENAI_MODEL=baai/bge-m3
+```
+
+> **注意**: 如果未配置 API Key，系统将自动回退到 Local 模式。
+
 ## 🐳 Docker 部署详情
 
 ### 服务架构

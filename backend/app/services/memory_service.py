@@ -7,6 +7,10 @@ from datetime import datetime
 from app.logger import get_logger
 import os
 import hashlib
+import asyncio
+from abc import ABC, abstractmethod
+from openai import AsyncOpenAI
+from app.config import settings
 
 logger = get_logger(__name__)
 
@@ -35,6 +39,118 @@ if 'SENTENCE_TRANSFORMERS_HOME' not in os.environ:
         logger.info(f"🔧 使用降级模型目录: {fallback_dir}")
 
 
+class EmbeddingProvider(ABC):
+    """Embedding提供商抽象基类"""
+    
+    @abstractmethod
+    async def encode(self, texts: List[str]) -> List[List[float]]:
+        """
+        生成文本向量
+        
+        Args:
+            texts: 文本列表
+            
+        Returns:
+            向量列表
+        """
+        pass
+
+class LocalEmbeddingProvider(EmbeddingProvider):
+    """本地Embedding提供商 (基于SentenceTransformers)"""
+    
+    def __init__(self):
+        self._model = None
+        self._initialize_model()
+        
+    def _initialize_model(self):
+        """初始化SentenceTransformer模型 (包含复杂的离线/在线加载逻辑)"""
+        try:
+            # 使用环境变量中配置的模型目录
+            model_cache_dir = os.environ.get('SENTENCE_TRANSFORMERS_HOME', 'embedding')
+            os.makedirs(model_cache_dir, exist_ok=True)
+            logger.info(f"📂 [LocalEmbedding] 使用模型缓存目录: {os.path.abspath(model_cache_dir)}")
+            
+            # 检查模型目录内容 (简化版检查，详细日志保留)
+            abs_cache_dir = os.path.abspath(model_cache_dir)
+            
+            try:
+                logger.info("🔄 [LocalEmbedding] 尝试加载主模型: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+                
+                # 优先尝试从本地路径加载
+                self._model = SentenceTransformer(
+                    'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+                    cache_folder=abs_cache_dir,
+                    device='cpu',
+                    trust_remote_code=True,
+                    local_files_only=False  # 允许自动下载
+                )
+                logger.info("✅ [LocalEmbedding] 模型加载成功")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ [LocalEmbedding] 主模型加载失败: {str(e)}")
+                logger.info("🔄 [LocalEmbedding] 尝试使用备用模型: sentence-transformers/all-MiniLM-L6-v2")
+                
+                # 降级到更小的模型
+                self._model = SentenceTransformer(
+                    'sentence-transformers/all-MiniLM-L6-v2',
+                    cache_folder=model_cache_dir,
+                    device='cpu',
+                    trust_remote_code=False
+                )
+                logger.info("✅ [LocalEmbedding] 备用模型加载成功")
+                
+        except Exception as e:
+            logger.error(f"❌ [LocalEmbedding] 所有模型加载失败: {str(e)}")
+            raise RuntimeError(f"无法加载Embedding模型: {str(e)}")
+
+    async def encode(self, texts: List[str]) -> List[List[float]]:
+        """异步执行同步的encode方法"""
+        if not self._model:
+            raise RuntimeError("模型未初始化")
+            
+        # 在线程池中运行CPU密集型任务，避免阻塞事件循环
+        loop = asyncio.get_running_loop()
+        
+        # SentenceTransformer.encode 返回 numpy array 或 list
+        # 我们确保返回 list[list[float]]
+        embeddings = await loop.run_in_executor(
+            None,
+            lambda: self._model.encode(texts, convert_to_numpy=False, convert_to_tensor=False)
+        )
+        
+        # 确保格式正确 (如果是单个字符串输入，ST会返回单个向量，但我们接口要求 List[str] -> List[List[float]])
+        # 这里 encode(texts) texts 是 List[str]，所以结果应该是 List[List[float]]
+        return embeddings
+
+class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
+    """OpenAI兼容接口 Embedding提供商 (支持NVIDIA NIM等)"""
+    
+    def __init__(self, api_key: str, base_url: str, model: str):
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+        self.model = model
+        logger.info(f"✅ [RemoteEmbedding] 初始化成功 (Model: {model}, URL: {base_url})")
+        
+    async def encode(self, texts: List[str]) -> List[List[float]]:
+        try:
+            # 替换换行符，因为某些Embedding模型对换行符敏感
+            cleaned_texts = [t.replace("\n", " ") for t in texts]
+            
+            response = await self.client.embeddings.create(
+                input=cleaned_texts,
+                model=self.model
+            )
+            
+            # 按索引排序确保顺序一致 (OpenAI通常保证顺序，但为了安全)
+            sorted_data = sorted(response.data, key=lambda x: x.index)
+            return [item.embedding for item in sorted_data]
+            
+        except Exception as e:
+            logger.error(f"❌ [RemoteEmbedding] 调用失败: {str(e)}")
+            raise
+
 class MemoryService:
     """向量记忆管理服务 - 实现语义检索和长期记忆"""
     
@@ -48,7 +164,7 @@ class MemoryService:
         return cls._instance
     
     def __init__(self):
-        """初始化ChromaDB和Embedding模型"""
+        """初始化ChromaDB和Embedding Provider"""
         if self._initialized:
             return
             
@@ -57,140 +173,30 @@ class MemoryService:
             chroma_dir = "data/chroma_db"
             os.makedirs(chroma_dir, exist_ok=True)
             
-            # 初始化ChromaDB客户端(使用新API - PersistentClient)
+            # 初始化ChromaDB客户端
             self.client = chromadb.PersistentClient(path=chroma_dir)
+            logger.info(f"✅ ChromaDB初始化成功 (目录: {chroma_dir})")
             
-            # 初始化多语言embedding模型(支持中文)
-            logger.info("🔄 正在加载Embedding模型...")
+            # 初始化Embedding Provider
+            provider_type = settings.embedding_provider
+            logger.info(f"🔄 初始化Embedding Provider: {provider_type}")
             
-            # 使用环境变量中配置的模型目录
-            model_cache_dir = os.environ.get('SENTENCE_TRANSFORMERS_HOME', 'embedding')
-            os.makedirs(model_cache_dir, exist_ok=True)
-            logger.info(f"📂 使用模型缓存目录: {os.path.abspath(model_cache_dir)}")
-            
-            # 调试信息：打印环境变量和路径
-            logger.info(f"📂 当前工作目录: {os.getcwd()}")
-            logger.info(f"📂 模型缓存目录: {os.path.abspath(model_cache_dir)}")
-            logger.info(f"🔧 SENTENCE_TRANSFORMERS_HOME: {os.environ.get('SENTENCE_TRANSFORMERS_HOME', '未设置')}")
-            logger.info(f"🔧 TRANSFORMERS_OFFLINE: {os.environ.get('TRANSFORMERS_OFFLINE', '未设置')}")
-            logger.info(f"🔧 HF_HUB_OFFLINE: {os.environ.get('HF_HUB_OFFLINE', '未设置')}")
-            
-            # 检查模型目录内容
-            abs_cache_dir = os.path.abspath(model_cache_dir)
-            logger.info(f"📂 检查模型缓存目录: {abs_cache_dir}")
-            
-            if os.path.exists(abs_cache_dir):
-                logger.info(f"📁 模型目录存在，检查内容...")
-                try:
-                    items = os.listdir(abs_cache_dir)
-                    logger.info(f"📁 模型目录内容 ({len(items)} 项): {items}")
-                    
-                    # 检查是否有预期的模型文件夹
-                    expected_model_dir = os.path.join(abs_cache_dir, 'models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2')
-                    logger.info(f"🔍 检查预期路径: {expected_model_dir}")
-                    
-                    if os.path.exists(expected_model_dir):
-                        logger.info(f"✅ 找到本地模型目录!")
-                        # 检查快照目录
-                        snapshots_dir = os.path.join(expected_model_dir, 'snapshots')
-                        if os.path.exists(snapshots_dir):
-                            snapshots = os.listdir(snapshots_dir)
-                            logger.info(f"📁 模型快照 ({len(snapshots)} 个): {snapshots}")
-                            # 检查是否有有效的快照
-                            if snapshots:
-                                logger.info(f"✅ 发现有效快照，可以使用离线模式")
-                    else:
-                        logger.warning(f"⚠️ 未找到本地模型目录")
-                        logger.warning(f"   预期位置: {expected_model_dir}")
-                except Exception as e:
-                    logger.error(f"❌ 检查模型目录失败: {str(e)}")
-                    import traceback
-                    logger.error(f"   堆栈: {traceback.format_exc()}")
-            else:
-                logger.warning(f"⚠️ 模型目录不存在: {abs_cache_dir}")
-            
-            try:
-                logger.info("🔄 尝试加载主模型: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-                
-                # 使用绝对路径检查本地模型
-                abs_cache_dir = os.path.abspath(model_cache_dir)
-                local_model_path = os.path.join(
-                    abs_cache_dir,
-                    'models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2'
-                )
-                
-                logger.info(f"🔍 检查本地模型路径: {local_model_path}")
-                logger.info(f"🔍 路径存在检查: {os.path.exists(local_model_path)}")
-                
-                # 检查快照目录是否存在且有内容
-                snapshots_dir = os.path.join(local_model_path, 'snapshots')
-                has_valid_model = False
-                if os.path.exists(snapshots_dir):
-                    try:
-                        snapshots = os.listdir(snapshots_dir)
-                        if snapshots:
-                            logger.info(f"✅ 发现本地模型快照: {snapshots}")
-                            has_valid_model = True
-                    except Exception as e:
-                        logger.warning(f"⚠️ 检查快照失败: {e}")
-                
-                # 优先尝试从本地路径加载
-                if has_valid_model:
-                    logger.info(f"✅ 检测到完整本地模型，使用离线模式加载")
-                    try:
-                        self.embedding_model = SentenceTransformer(
-                            'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-                            cache_folder=abs_cache_dir,
-                            device='cpu',
-                            trust_remote_code=True,
-                            local_files_only=True  # 强制使用本地文件
-                        )
-                        logger.info("✅ Embedding模型加载成功 (离线模式)")
-                    except Exception as local_err:
-                        logger.warning(f"⚠️ 离线模式加载失败: {str(local_err)}")
-                        logger.info("🔄 尝试在线模式...")
-                        raise local_err
+            if provider_type == "openai":
+                if not settings.embedding_openai_api_key:
+                    logger.warning("⚠️ 配置为OpenAI/NVIDIA Embedding但未提供API Key，将回退到Local模式")
+                    self.provider = LocalEmbeddingProvider()
                 else:
-                    logger.info("📥 本地模型不完整或不存在，将联网下载...")
-                    logger.info(f"   下载后将保存到: {abs_cache_dir}")
-                    self.embedding_model = SentenceTransformer(
-                        'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
-                        cache_folder=abs_cache_dir,
-                        device='cpu',
-                        trust_remote_code=True,
-                        local_files_only=False  # 允许联网下载
+                    self.provider = OpenAICompatibleEmbeddingProvider(
+                        api_key=settings.embedding_openai_api_key,
+                        base_url=settings.embedding_openai_base_url,
+                        model=settings.embedding_openai_model
                     )
-                    logger.info("✅ Embedding模型加载成功 (在线下载)")
-            except Exception as e:
-                logger.warning(f"⚠️ 无法加载多语言模型: {str(e)}")
-                logger.error(f"❌ 详细错误: {repr(e)}")
-                import traceback
-                logger.error(f"❌ 错误堆栈:\n{traceback.format_exc()}")
-                logger.info("🔄 尝试使用备用模型: sentence-transformers/all-MiniLM-L6-v2")
-                try:
-                    # 降级到更小的模型作为备选
-                    self.embedding_model = SentenceTransformer(
-                        'sentence-transformers/all-MiniLM-L6-v2',
-                        cache_folder=model_cache_dir,
-                        device='cpu',
-                        trust_remote_code=False
-                    )
-                    logger.info("✅ 使用备用Embedding模型 (all-MiniLM-L6-v2)")
-                except Exception as e2:
-                    logger.error(f"❌ 所有模型加载失败: {str(e2)}")
-                    logger.error(f"❌ 详细错误: {repr(e2)}")
-                    import traceback
-                    logger.error(f"❌ 错误堆栈:\n{traceback.format_exc()}")
-                    logger.error("💡 模型首次使用需要联网下载（约420MB）")
-                    logger.error("   或手动下载模型文件到 embedding 目录")
-                    logger.error(f"💡 期望的模型目录结构:")
-                    logger.error(f"   {os.path.abspath(model_cache_dir)}/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/")
-                    raise RuntimeError("无法加载任何Embedding模型")
+            else:
+                # 默认为local
+                self.provider = LocalEmbeddingProvider()
             
             self._initialized = True
-            logger.info("✅ MemoryService初始化成功")
-            logger.info(f"  - ChromaDB目录: {chroma_dir}")
-            logger.info(f"  - Embedding模型: paraphrase-multilingual-MiniLM-L12-v2")
+            logger.info("✅ MemoryService初始化完成")
             
         except Exception as e:
             logger.error(f"❌ MemoryService初始化失败: {str(e)}")
@@ -262,7 +268,8 @@ class MemoryService:
             collection = self.get_collection(user_id, project_id)
             
             # 生成文本的向量表示
-            embedding = self.embedding_model.encode(content).tolist()
+            embeddings = await self.provider.encode([content])
+            embedding = embeddings[0]
             
             # 准备元数据(ChromaDB要求所有值为基础类型)
             chroma_metadata = {
@@ -330,12 +337,12 @@ class MemoryService:
             for mem in memories:
                 ids.append(mem['id'])
                 documents.append(mem['content'])
-                
-                # 生成embedding
-                embedding = self.embedding_model.encode(mem['content']).tolist()
-                embeddings.append(embedding)
-                
-                # 准备元数据
+            
+            # 批量生成embedding (性能优化：批量调用Provider)
+            embeddings = await self.provider.encode(documents)
+            
+            # 准备元数据
+            for i, mem in enumerate(memories):
                 metadata = mem.get('metadata', {})
                 chroma_metadata = {
                     "memory_type": mem['type'],
@@ -393,7 +400,8 @@ class MemoryService:
             collection = self.get_collection(user_id, project_id)
             
             # 生成查询向量
-            query_embedding = self.embedding_model.encode(query).tolist()
+            embeddings = await self.provider.encode([query])
+            query_embedding = embeddings[0]
             
             # 构建过滤条件 - ChromaDB要求使用$and组合多个条件
             where_filter = None
@@ -796,7 +804,8 @@ class MemoryService:
             
             if content:
                 # 重新生成embedding
-                embedding = self.embedding_model.encode(content).tolist()
+                embeddings = await self.provider.encode([content])
+                embedding = embeddings[0]
                 update_data['embeddings'] = [embedding]
                 update_data['documents'] = [content]
             

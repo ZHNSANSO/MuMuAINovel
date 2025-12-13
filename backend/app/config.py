@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     default_temperature: float = 0.7
     default_max_tokens: int = 32000
     
+    # Embedding服务配置
+    embedding_provider: str = "local"  # local, openai
+    embedding_openai_api_key: Optional[str] = None
+    embedding_openai_base_url: Optional[str] = None
+    embedding_openai_model: str = "baai/bge-m3"  # 默认模型
+    
     # MCP适配器配置
     enable_mcp_adapter: bool = True  # 是否启用MCP适配器（自动检测API能力）
     mcp_adapter_cache_ttl_hours: int = 24  # API能力检测缓存时长（小时）
